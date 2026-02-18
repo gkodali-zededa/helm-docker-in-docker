@@ -121,6 +121,54 @@ $ helm uninstall "${DIND_NAME}"
 ```
 
 
+## Bridge / Multi-interface NAT
+
+When `bridge.enabled: true`, the chart creates a Multus bridge network (`net1`) and a
+DaemonSet that configures iptables DNAT + policy-based routing on every node so the dind
+pod is reachable from any physical interface (ethernet, WiFi, 5G).
+
+### Policy-based routing
+
+`bridge.routing` controls a custom routing table and firewall marks that guarantee DNAT
+reply packets exit on the same interface the original packet arrived on.
+
+| Value | Purpose |
+|---|---|
+| `bridge.routing.enabled` | Enable policy routing (custom table + fwmark ip rules) |
+| `bridge.routing.tableId` | Global routing table ID (1-252) |
+| `bridge.routing.fwmark` | Global firewall mark (fallback for rules without per-port routing) |
+| `bridge.routing.outbound.interface` | Interface pod-originated traffic exits |
+
+### Per-port isolated routing
+
+Each entry in `bridge.portForwarding.rules` may include an optional `routing:` block to
+assign it a unique fwmark and a dedicated routing table. This ensures connections arriving
+on different interfaces reply on the same interface — even when ports are served by
+different NICs simultaneously.
+
+```yaml
+bridge:
+  portForwarding:
+    rules:
+      - name: web-app
+        hostPort: 30080
+        destIP: "10.20.0.10"
+        destPort: 8080
+        protocol: tcp
+        routing:
+          fwmark: "0x65"         # unique hex mark
+          tableId: 101           # dedicated routing table (must differ from bridge.routing.tableId)
+          tableName: "dind_eth0"
+          outbound:
+            interface: "eth0"    # replies exit this interface
+```
+
+Rules without a `routing:` block fall back to the global `bridge.routing` table.
+
+See [`docs/bridge-network-diagram.md`](../../docs/bridge-network-diagram.md) for full
+architecture diagrams and packet flow traces.
+
+
 ## NOTES
 
  - This is not designed for production use; buyer beware.

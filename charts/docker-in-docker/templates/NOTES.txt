@@ -19,3 +19,31 @@ To connect to the Docker daemon:
        DOCKER_HOST=tcp://{{ include "dind.fullname" . }}:{{ include "dind.servicePort" . }}
   3. Use your Docker client as normal.
 {{- end }}
+
+{{- if .Values.bridge.enabled }}
+
+Bridge Network Mode is ENABLED.
+
+  The DinD pod has a secondary interface (net1) on bridge {{ .Values.bridge.name }}
+  with IP from subnet {{ .Values.bridge.ipam.subnet }}.
+
+  Port Mappings (accessible from ANY host interface):
+  {{- range .Values.bridge.routing.networkAdapters }}
+  {{- $adapter := . }}
+  {{- range .portForwarding.rules }}
+    {{ .name }} (via {{ $adapter.name }}): 0.0.0.0:{{ .hostPort }} -> {{ .destIP }}:{{ .destPort }}/{{ .protocol }}
+  {{- end }}
+  {{- end }}
+
+  To test connectivity from any host interface:
+  {{- range .Values.bridge.routing.networkAdapters }}
+  {{- range .portForwarding.rules }}
+    curl http://<host-ip>:{{ .hostPort }}    # {{ .name }}
+  {{- end }}
+  {{- end }}
+
+  Verification commands:
+    kubectl get network-attachment-definitions
+    kubectl exec <dind-pod> -- ip addr show net1
+    ssh <host> -- iptables -t nat -L PREROUTING -n
+{{- end }}

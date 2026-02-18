@@ -1,0 +1,559 @@
+{{- if .Values.bridge.enabled }}
+{{- if .Values.bridge.routing.enabled }}
+
+{{- /* ===== VALIDATION ===== */}}
+
+{{- /* 1. Exactly one adapter must have preferred: true */}}
+{{- $preferredCount := 0 }}
+{{- range .Values.bridge.routing.networkAdapters }}
+{{- if .preferred }}
+{{- $preferredCount = add $preferredCount 1 }}
+{{- end }}
+{{- end }}
+{{- if ne $preferredCount 1 }}
+{{- fail (printf "bridge.routing.networkAdapters: exactly one adapter must have preferred: true (found %d)" $preferredCount) }}
+{{- end }}
+
+{{- /* 2. tableId values: in range 1-252 and unique across adapters */}}
+{{- $tableIds := dict }}
+{{- range .Values.bridge.routing.networkAdapters }}
+{{- $tid := int .tableId }}
+{{- if lt $tid 1 }}
+{{- fail (printf "bridge.routing.networkAdapters[%s].tableId must be >= 1" .name) }}
+{{- end }}
+{{- if gt $tid 252 }}
+{{- fail (printf "bridge.routing.networkAdapters[%s].tableId must be <= 252 (253-255 are reserved)" .name) }}
+{{- end }}
+{{- if hasKey $tableIds (toString $tid) }}
+{{- fail (printf "bridge.routing.networkAdapters: duplicate tableId %d (adapters: %s and %s)" $tid (index $tableIds (toString $tid)) .name) }}
+{{- end }}
+{{- $_ := set $tableIds (toString $tid) .name }}
+{{- end }}
+
+{{- /* 3. fwmark values must be unique across adapters */}}
+{{- $fwmarks := dict }}
+{{- range .Values.bridge.routing.networkAdapters }}
+{{- if hasKey $fwmarks .fwmark }}
+{{- fail (printf "bridge.routing.networkAdapters: duplicate fwmark %s (adapters: %s and %s)" .fwmark (index $fwmarks .fwmark) .name) }}
+{{- end }}
+{{- $_ := set $fwmarks .fwmark .name }}
+{{- end }}
+
+{{- /* 4. Adapter name values must be unique */}}
+{{- $adapterNames := dict }}
+{{- range .Values.bridge.routing.networkAdapters }}
+{{- if hasKey $adapterNames .name }}
+{{- fail (printf "bridge.routing.networkAdapters: duplicate adapter name %s" .name) }}
+{{- end }}
+{{- $_ := set $adapterNames .name "1" }}
+{{- end }}
+
+{{- /* 5. For each unique (protocol, hostPort) across all adapters' rules, all entries must share the same (destIP, destPort) */}}
+{{- $portDestMap := dict }}
+{{- range .Values.bridge.routing.networkAdapters }}
+{{- range .portForwarding.rules }}
+{{- $key := printf "%s:%s" .protocol (toString .hostPort) }}
+{{- $val := printf "%s:%s" .destIP (toString .destPort) }}
+{{- if hasKey $portDestMap $key }}
+{{- if ne (index $portDestMap $key) $val }}
+{{- fail (printf "bridge.routing.networkAdapters: ambiguous OUTPUT DNAT for %s — conflicting destinations %s vs %s (same hostPort on multiple adapters must map to the same destIP:destPort)" $key (index $portDestMap $key) $val) }}
+{{- end }}
+{{- else }}
+{{- $_ := set $portDestMap $key $val }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{- end }}{{- /* end routing.enabled validation */}}
+
+{{- /* ===== FIND PREFERRED ADAPTER (for from-subnet rule) ===== */}}
+{{- $preferredAdapter := dict }}
+{{- if .Values.bridge.routing.enabled }}
+{{- range .Values.bridge.routing.networkAdapters }}
+{{- if .preferred }}
+{{- $preferredAdapter = . }}
+{{- end }}
+{{- end }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "dind.fullname" . }}-bridge-nat
+  labels:
+    {{- include "dind.labels" . | nindent 4 }}
+data:
+  setup-nat.sh: |
+    #!/bin/sh
+    set -e
+
+    # --- Install iptables and iproute2 ---
+    apk add --no-cache iptables iptables-legacy iproute2
+
+    # Alpine defaults to the nf_tables backend, which fails in many
+    # container/host combinations. Force the legacy (xtables) backend.
+    LEGACY_BIN=""
+    for p in /usr/sbin/iptables-legacy /sbin/iptables-legacy; do
+      if [ -x "$p" ]; then
+        LEGACY_BIN="$p"
+        break
+      fi
+    done
+    if [ -z "$LEGACY_BIN" ]; then
+      LEGACY_BIN=$(command -v iptables-legacy 2>/dev/null || true)
+    fi
+
+    if [ -n "$LEGACY_BIN" ]; then
+      CURRENT_BIN=$(command -v iptables)
+      ln -sf "$LEGACY_BIN" "$CURRENT_BIN"
+    fi
+
+    BRIDGE={{ .Values.bridge.name | quote }}
+    SUBNET={{ .Values.bridge.ipam.subnet | quote }}
+
+    # --- Enable IP forwarding ---
+    sysctl -w net.ipv4.ip_forward=1
+
+    {{- if .Values.bridge.routing.enabled }}
+    # ===== ROUTING TABLE REGISTRATION =====
+    echo "Registering routing tables..."
+    {{- range .Values.bridge.routing.networkAdapters }}
+    grep -q "{{ .tableId }} {{ .tableName }}" /etc/iproute2/rt_tables || \
+      echo "{{ .tableId }} {{ .tableName }}" >> /etc/iproute2/rt_tables
+    echo "  Registered table {{ .tableId }} {{ .tableName }}"
+    {{- end }}
+
+    # ===== WAIT FOR BRIDGE INTERFACE =====
+    echo "Waiting for bridge interface $BRIDGE..."
+    for i in $(seq 1 30); do
+      if ip link show "$BRIDGE" >/dev/null 2>&1; then
+        echo "Bridge $BRIDGE is ready"
+        break
+      fi
+      if [ $i -eq 30 ]; then
+        echo "ERROR: Bridge $BRIDGE not found after 30 seconds"
+        exit 1
+      fi
+      sleep 1
+    done
+
+    # ===== PER-ADAPTER ROUTING TABLE SETUP =====
+    {{- range .Values.bridge.routing.networkAdapters }}
+    echo "--- Setting up routing for adapter {{ .name }} (table {{ .tableId }}: {{ .tableName }}) ---"
+
+    # Flush existing routes in this table (idempotent)
+    ip route flush table {{ .tableId }} 2>/dev/null || true
+
+    # Add local bridge subnet route
+    ip route add "$SUBNET" dev "$BRIDGE" scope link table {{ .tableId }}
+    echo "  Added route: $SUBNET dev $BRIDGE (table {{ .tableId }})"
+
+    {{- if .useDefaultRoute }}
+    # Copy default route from main table
+    _DEFAULT_ROUTE=$(ip route show default | head -n1)
+    if [ -n "$_DEFAULT_ROUTE" ]; then
+      ip route add $_DEFAULT_ROUTE table {{ .tableId }}
+      echo "  Copied default route to table {{ .tableId }}: $_DEFAULT_ROUTE"
+    else
+      echo "  WARNING: No default route found in main table for adapter {{ .name }}"
+    fi
+    {{- else }}
+    # Wait for adapter {{ .name }} to be ready
+    echo "  Waiting for interface {{ .name }}..."
+    for i in $(seq 1 30); do
+      if ip link show {{ .name | quote }} >/dev/null 2>&1; then
+        echo "  Interface {{ .name }} is ready"
+        break
+      fi
+      if [ $i -eq 30 ]; then
+        echo "  ERROR: Interface {{ .name }} not found after 30 seconds"
+        exit 1
+      fi
+      sleep 1
+    done
+
+    {{- if .gateway }}
+    _ADAPTER_GW={{ .gateway | quote }}
+    echo "  Using configured gateway: $_ADAPTER_GW for {{ .name }}"
+    {{- else }}
+    # Discover gateway for adapter {{ .name }}
+    echo "  Discovering gateway for {{ .name }}..."
+    _ADAPTER_GW=""
+
+    # Method 1: default route via this interface
+    _ADAPTER_GW=$(ip route show default dev {{ .name | quote }} 2>/dev/null | head -n1 | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1)}')
+
+    if [ -z "$_ADAPTER_GW" ]; then
+      # Method 2: any route with a gateway through this interface
+      _ADAPTER_GW=$(ip route show dev {{ .name | quote }} 2>/dev/null | grep via | head -n1 | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1)}')
+    fi
+
+    if [ -z "$_ADAPTER_GW" ]; then
+      # Method 3: ip route get via interface IP
+      _IFACE_IP=$(ip -4 addr show {{ .name | quote }} 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 | head -n1)
+      if [ -n "$_IFACE_IP" ]; then
+        _ADAPTER_GW=$(ip route get 8.8.8.8 from "$_IFACE_IP" 2>/dev/null | head -n1 | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1)}')
+      fi
+    fi
+
+    if [ -n "$_ADAPTER_GW" ]; then
+      echo "  Discovered gateway: $_ADAPTER_GW for {{ .name }}"
+    else
+      echo "  No gateway found for {{ .name }}, will use direct routing"
+    fi
+    {{- end }}{{- /* end if .gateway */}}
+
+    # Add default route for adapter {{ .name }}
+    if [ -n "$_ADAPTER_GW" ]; then
+      ip route add default via "$_ADAPTER_GW" dev {{ .name | quote }} table {{ .tableId }}
+      echo "  Added default route via $_ADAPTER_GW dev {{ .name }} (table {{ .tableId }})"
+    else
+      ip route add default dev {{ .name | quote }} table {{ .tableId }}
+      echo "  Added default route dev {{ .name }} (table {{ .tableId }})"
+    fi
+    {{- end }}{{- /* end if .useDefaultRoute */}}
+    {{- end }}{{- /* end range networkAdapters */}}
+
+    # ===== IP RULES =====
+    echo "Configuring ip rules..."
+
+    # Per-adapter fwmark rules: marked packets exit via their adapter's routing table
+    {{- range .Values.bridge.routing.networkAdapters }}
+    ip rule del fwmark {{ .fwmark }} table {{ .tableId }} 2>/dev/null || true
+    ip rule add fwmark {{ .fwmark }} table {{ .tableId }} priority {{ $.Values.bridge.routing.rulePriority }}
+    echo "  Added ip rule: fwmark {{ .fwmark }} -> table {{ .tableName }} (priority {{ $.Values.bridge.routing.rulePriority }})"
+    {{- end }}
+
+    # From-subnet rule: pod-originated (non-DNAT) traffic uses the preferred adapter's table
+    _FROM_SUBNET_PRIORITY=$(( {{ .Values.bridge.routing.rulePriority }} + 10 ))
+    ip rule del from "$SUBNET" table {{ $preferredAdapter.tableId }} 2>/dev/null || true
+    ip rule add from "$SUBNET" table {{ $preferredAdapter.tableId }} priority $_FROM_SUBNET_PRIORITY
+    echo "  Added ip rule: from $SUBNET -> table {{ $preferredAdapter.tableName }} (priority $_FROM_SUBNET_PRIORITY)"
+
+    {{- range .Values.bridge.routing.prefixRoutes }}
+    # Prefix route: {{ .prefix }} -> table {{ .tableName }}
+    ip rule del to {{ .prefix }} table {{ .tableId }} 2>/dev/null || true
+    ip rule add to {{ .prefix }} table {{ .tableId }} priority {{ .priority }}
+    echo "  Added ip rule: to {{ .prefix }} -> table {{ .tableName }} (priority {{ .priority }})"
+    {{- end }}
+
+    echo "Policy routing setup complete"
+    {{- end }}{{- /* end if routing.enabled */}}
+
+    # --- Create custom chains (idempotent) ---
+    iptables -t nat -N DIND-POSTROUTING 2>/dev/null || true
+    iptables -t nat -N DIND-PREROUTING 2>/dev/null || true
+    iptables -t nat -N DIND-OUTPUT 2>/dev/null || true
+    iptables -N DIND-FORWARD 2>/dev/null || true
+    {{- if .Values.bridge.routing.enabled }}
+    # Create mangle table chain for per-adapter packet marking
+    iptables -t mangle -N DIND-MARK 2>/dev/null || true
+    {{- end }}
+
+    # --- Jump from built-in chains to custom chains (early interception) ---
+    # CRITICAL: Insert at position 1 to run BEFORE K3S chains
+
+    # nat table jumps
+    iptables -t nat -C POSTROUTING -j DIND-POSTROUTING 2>/dev/null || \
+      iptables -t nat -I POSTROUTING 1 -j DIND-POSTROUTING
+    iptables -t nat -C PREROUTING -j DIND-PREROUTING 2>/dev/null || \
+      iptables -t nat -I PREROUTING 1 -j DIND-PREROUTING
+    iptables -t nat -C OUTPUT -j DIND-OUTPUT 2>/dev/null || \
+      iptables -t nat -I OUTPUT 1 -j DIND-OUTPUT
+
+    # filter table jump
+    iptables -C FORWARD -j DIND-FORWARD 2>/dev/null || \
+      iptables -I FORWARD 1 -j DIND-FORWARD
+
+    {{- if .Values.bridge.routing.enabled }}
+    # mangle table jump (for policy routing)
+    iptables -t mangle -C PREROUTING -j DIND-MARK 2>/dev/null || \
+      iptables -t mangle -I PREROUTING 1 -j DIND-MARK
+    {{- end }}
+
+    echo "Inserted DIND chains at priority 1 (before K3S chains)"
+
+    # --- Flush custom chains for a clean slate on restart ---
+    iptables -t nat -F DIND-POSTROUTING
+    iptables -t nat -F DIND-PREROUTING
+    iptables -t nat -F DIND-OUTPUT
+    iptables -F DIND-FORWARD
+    {{- if .Values.bridge.routing.enabled }}
+    iptables -t mangle -F DIND-MARK
+    {{- end }}
+
+    {{- if .Values.bridge.routing.enabled }}
+    # ===== MANGLE DIND-MARK: PER-ADAPTER PACKET MARKING =====
+    # Each adapter marks NEW inbound connections with its unique fwmark (grouped by protocol via multiport).
+    # Reply packets restore the saved connmark so they exit the same adapter.
+    echo "Configuring per-adapter packet marking..."
+
+    {{- range .Values.bridge.routing.networkAdapters }}
+    {{- $adapter := . }}
+    {{- $tcpPorts := list }}
+    {{- $udpPorts := list }}
+    {{- range .portForwarding.rules }}
+    {{- if eq (lower .protocol) "tcp" }}
+    {{- $tcpPorts = append $tcpPorts (toString .hostPort) }}
+    {{- else if eq (lower .protocol) "udp" }}
+    {{- $udpPorts = append $udpPorts (toString .hostPort) }}
+    {{- end }}
+    {{- end }}
+    {{- if $tcpPorts }}
+    iptables -t mangle -A DIND-MARK \
+      -i {{ $adapter.name | quote }} -p tcp \
+      -m multiport --dports {{ join "," $tcpPorts }} \
+      -m conntrack --ctstate NEW \
+      -j MARK --set-mark {{ $adapter.fwmark }}
+    echo "  Adapter {{ $adapter.name }}: marked tcp ports {{ join "," $tcpPorts }} -> fwmark {{ $adapter.fwmark }}"
+    {{- end }}
+    {{- if $udpPorts }}
+    iptables -t mangle -A DIND-MARK \
+      -i {{ $adapter.name | quote }} -p udp \
+      -m multiport --dports {{ join "," $udpPorts }} \
+      -m conntrack --ctstate NEW \
+      -j MARK --set-mark {{ $adapter.fwmark }}
+    echo "  Adapter {{ $adapter.name }}: marked udp ports {{ join "," $udpPorts }} -> fwmark {{ $adapter.fwmark }}"
+    {{- end }}
+    {{- end }}{{- /* end range networkAdapters */}}
+
+    # Persist any non-zero mark into the conntrack entry (covers all adapter marks)
+    iptables -t mangle -A DIND-MARK \
+      -m mark ! --mark 0x0 \
+      -j CONNMARK --save-mark
+
+    # Restore saved mark on reply packets so they exit the original adapter
+    iptables -t mangle -A DIND-MARK \
+      -m conntrack --ctstate ESTABLISHED,RELATED \
+      -j CONNMARK --restore-mark
+
+    echo "Packet marking configured"
+    {{- end }}{{- /* end if routing.enabled */}}
+
+    # ===== NAT RULES =====
+    echo "Configuring NAT rules..."
+
+    # POSTROUTING: Masquerade outbound traffic from bridge subnet
+    iptables -t nat -A DIND-POSTROUTING -s "$SUBNET" ! -o "$BRIDGE" -j MASQUERADE
+    iptables -t nat -A DIND-POSTROUTING -d "$SUBNET" -o "$BRIDGE" -j MASQUERADE
+    iptables -t nat -A DIND-POSTROUTING -s "$SUBNET" -j ACCEPT
+
+    echo "NAT POSTROUTING configured for subnet $SUBNET"
+
+    # PREROUTING: Adapter-scoped DNAT for inbound port forwarding
+    # Each rule is gated on -i <adapter> so the same hostPort can appear on multiple adapters
+    {{- range .Values.bridge.routing.networkAdapters }}
+    {{- $adapter := . }}
+    {{- range .portForwarding.rules }}
+    iptables -t nat -A DIND-PREROUTING \
+      -i {{ $adapter.name | quote }} -p {{ .protocol }} --dport {{ .hostPort }} \
+      -j DNAT --to-destination {{ .destIP }}:{{ .destPort }}
+    {{- end }}
+    {{- end }}
+    iptables -t nat -A DIND-PREROUTING -m mark --mark 0x100 -j ACCEPT
+
+    echo "NAT PREROUTING configured"
+
+    # OUTPUT: DNAT for localhost-originated traffic (no -i available at OUTPUT hook)
+    # Deduplicated by (protocol, hostPort) — first-defined adapter's rule wins.
+    # Ambiguous OUTPUT DNAT (same port, different destinations) is rejected at validation time.
+    {{- $outputRules := dict }}
+    {{- range .Values.bridge.routing.networkAdapters }}
+    {{- range .portForwarding.rules }}
+    {{- $key := printf "%s:%s" .protocol (toString .hostPort) }}
+    {{- if not (hasKey $outputRules $key) }}
+    {{- $_ := set $outputRules $key . }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- range $key, $rule := $outputRules }}
+    iptables -t nat -A DIND-OUTPUT \
+      -p {{ $rule.protocol }} --dport {{ $rule.hostPort }} \
+      -j DNAT --to-destination {{ $rule.destIP }}:{{ $rule.destPort }}
+    {{- end }}
+
+    echo "NAT OUTPUT configured"
+
+    # FORWARD: Allow traffic to/from bridge
+    iptables -A DIND-FORWARD -i "$BRIDGE" -j ACCEPT
+    iptables -A DIND-FORWARD -o "$BRIDGE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+    # Accept forwarded traffic to DNAT destinations
+    {{- range .Values.bridge.routing.networkAdapters }}
+    {{- range .portForwarding.rules }}
+    iptables -A DIND-FORWARD -p {{ .protocol }} -d {{ .destIP }} --dport {{ .destPort }} -j ACCEPT
+    {{- end }}
+    {{- end }}
+
+    # Accept all traffic to/from bridge (catches edge cases)
+    iptables -A DIND-FORWARD -i "$BRIDGE" -j ACCEPT
+    iptables -A DIND-FORWARD -o "$BRIDGE" -j ACCEPT
+
+    echo "FORWARD rules configured for bridge $BRIDGE"
+
+    echo ""
+    echo "===== DIND NETWORKING VERIFICATION ====="
+
+    {{- if .Values.bridge.routing.enabled }}
+    echo "=== Policy Routing ==="
+    {{- range .Values.bridge.routing.networkAdapters }}
+    echo "Routing table {{ .tableName }} ({{ .tableId }}, adapter {{ .name }}{{ if .preferred }}, PREFERRED{{ end }}):"
+    ip route show table {{ .tableId }}
+    echo ""
+    {{- end }}
+    echo "IP rules:"
+    ip rule list
+    echo ""
+    {{- end }}
+
+    echo "=== iptables Chain Order (Early Interception Verification) ==="
+    echo "nat/PREROUTING (DIND should be first):"
+    iptables -t nat -L PREROUTING -n -v --line-numbers | head -5
+    echo ""
+    echo "nat/POSTROUTING (DIND should be first):"
+    iptables -t nat -L POSTROUTING -n -v --line-numbers | head -5
+    echo ""
+    echo "filter/FORWARD (DIND should be first):"
+    iptables -L FORWARD -n -v --line-numbers | head -5
+    echo ""
+
+    {{- if .Values.bridge.routing.enabled }}
+    echo "mangle/PREROUTING (DIND should be first):"
+    iptables -t mangle -L PREROUTING -n -v --line-numbers | head -5
+    echo ""
+    {{- end }}
+
+    echo "=== Custom Chain Rules ==="
+    iptables -t nat -L DIND-POSTROUTING -n -v
+    echo ""
+    iptables -t nat -L DIND-PREROUTING -n -v
+    echo ""
+    iptables -L DIND-FORWARD -n -v
+    echo ""
+
+    {{- if .Values.bridge.routing.enabled }}
+    iptables -t mangle -L DIND-MARK -n -v
+    echo ""
+    echo "IP rules summary:"
+    ip rule list
+    echo ""
+    {{- end }}
+
+    echo "========================================="
+    echo "DIND networking setup complete"
+    echo ""
+
+    # Cleanup function for graceful shutdown
+    cleanup() {
+      echo "Cleaning up iptables and routing rules..."
+
+      # Remove jump rules from built-in chains
+      iptables -t nat -D POSTROUTING -j DIND-POSTROUTING 2>/dev/null || true
+      iptables -t nat -D PREROUTING -j DIND-PREROUTING 2>/dev/null || true
+      iptables -t nat -D OUTPUT -j DIND-OUTPUT 2>/dev/null || true
+      iptables -D FORWARD -j DIND-FORWARD 2>/dev/null || true
+      {{- if .Values.bridge.routing.enabled }}
+      iptables -t mangle -D PREROUTING -j DIND-MARK 2>/dev/null || true
+      {{- end }}
+
+      # Flush custom chains
+      iptables -t nat -F DIND-POSTROUTING 2>/dev/null || true
+      iptables -t nat -F DIND-PREROUTING 2>/dev/null || true
+      iptables -t nat -F DIND-OUTPUT 2>/dev/null || true
+      iptables -F DIND-FORWARD 2>/dev/null || true
+      {{- if .Values.bridge.routing.enabled }}
+      iptables -t mangle -F DIND-MARK 2>/dev/null || true
+      {{- end }}
+
+      # Delete custom chains
+      iptables -t nat -X DIND-POSTROUTING 2>/dev/null || true
+      iptables -t nat -X DIND-PREROUTING 2>/dev/null || true
+      iptables -t nat -X DIND-OUTPUT 2>/dev/null || true
+      iptables -X DIND-FORWARD 2>/dev/null || true
+      {{- if .Values.bridge.routing.enabled }}
+      iptables -t mangle -X DIND-MARK 2>/dev/null || true
+      {{- end }}
+
+      {{- if .Values.bridge.routing.enabled }}
+      echo "Cleaning up policy routing..."
+      # Remove per-adapter fwmark rules and flush their routing tables
+      {{- range .Values.bridge.routing.networkAdapters }}
+      ip rule del fwmark {{ .fwmark }} table {{ .tableId }} 2>/dev/null || true
+      ip route flush table {{ .tableId }} 2>/dev/null || true
+      {{- end }}
+      # Remove from-subnet rule for preferred adapter
+      ip rule del from "$SUBNET" table {{ $preferredAdapter.tableId }} 2>/dev/null || true
+      {{- range .Values.bridge.routing.prefixRoutes }}
+      # Remove prefix route rule: {{ .prefix }}
+      ip rule del to {{ .prefix }} table {{ .tableId }} 2>/dev/null || true
+      {{- end }}
+      {{- end }}
+
+      echo "Cleanup complete"
+      exit 0
+    }
+
+    trap cleanup TERM INT
+
+    # Keep running so rules stay active; sleep in background for trap to work
+    while true; do
+      sleep 3600 &
+      wait $!
+    done
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "dind.fullname" . }}-bridge-nat
+  labels:
+    {{- include "dind.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bridge-nat
+spec:
+  selector:
+    matchLabels:
+      {{- include "dind.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: bridge-nat
+  template:
+    metadata:
+      labels:
+        {{- include "dind.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: bridge-nat
+    spec:
+      hostNetwork: true
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: nat-setup
+          image: alpine:3.19
+          command: ["/bin/sh", "/scripts/setup-nat.sh"]
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - NET_ADMIN
+                - NET_RAW
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            {{- if .Values.bridge.routing.enabled }}
+            - name: iproute2-config
+              mountPath: /etc/iproute2
+            {{- end }}
+      terminationGracePeriodSeconds: 10
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ include "dind.fullname" . }}-bridge-nat
+            defaultMode: 0755
+        {{- if .Values.bridge.routing.enabled }}
+        - name: iproute2-config
+          hostPath:
+            path: /etc/iproute2
+            type: Directory
+        {{- end }}
+{{- end }}

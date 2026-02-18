@@ -6,12 +6,28 @@ metadata:
   labels:
     {{- include "dind.labels" . | nindent 4 }}
 spec:
+  {{- if .Values.bridge.enabled }}
+  type: ClusterIP
+  {{- else }}
   type: {{ .Values.service.type }}
+  {{- end }}
   ports:
     - port: {{ include "dind.servicePort" . }}
       targetPort: {{ include "dind.dockerPort" . }}
       protocol: TCP
       name: docker
+      {{- if and (not .Values.bridge.enabled) .Values.service.nodePort }}
+      nodePort: {{ .Values.service.nodePort }}
+      {{- end }}
+    {{- range .Values.service.extraPorts }}
+    - port: {{ .port }}
+      targetPort: {{ .targetPort | default .port }}
+      protocol: {{ .protocol | default "TCP" }}
+      name: {{ .name }}
+      {{- if and (not $.Values.bridge.enabled) .nodePort }}
+      nodePort: {{ .nodePort }}
+      {{- end }}
+    {{- end }}
   selector:
     {{- include "dind.selectorLabels" . | nindent 4 }}
 {{- end }}

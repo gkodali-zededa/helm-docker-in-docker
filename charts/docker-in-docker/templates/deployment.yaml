@@ -13,10 +13,13 @@ spec:
       {{- include "dind.selectorLabels" . | nindent 6 }}
   template:
     metadata:
-      {{- with .Values.podAnnotations }}
       annotations:
+        {{- if .Values.bridge.enabled }}
+        k8s.v1.cni.cncf.io/networks: '[{"name": "{{ include "dind.fullname" . }}-bridge", "ips": ["{{ .Values.bridge.staticIP }}"]}]'
+        {{- end }}
+        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
       labels:
         {{- include "dind.selectorLabels" . | nindent 8 }}
     spec:
@@ -51,6 +54,25 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
 
+      {{- if .Values.bridge.enabled }}
+      initContainers:
+        - name: wait-for-bridge
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Waiting for net1 interface..."
+              for i in $(seq 1 30); do
+                if ip addr show net1 2>/dev/null | grep -q 'inet '; then
+                  echo "net1 interface is ready"
+                  exit 0
+                fi
+                sleep 1
+              done
+              echo "WARNING: net1 not ready after 30s, continuing anyway"
+              exit 0
+      {{- end }}
       containers:
 
         - name: dind
@@ -89,6 +111,15 @@ spec:
           securityContext:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          ports:
+            - name: docker
+              containerPort: {{ include "dind.dockerPort" . }}
+              protocol: TCP
+            {{- range .Values.service.extraPorts }}
+            - name: {{ .name }}
+              containerPort: {{ .targetPort | default .port }}
+              protocol: {{ .protocol | default "TCP" }}
+            {{- end }}
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}

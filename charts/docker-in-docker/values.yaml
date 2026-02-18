@@ -95,9 +95,18 @@ securityContext: {}
 
 service:
   enabled: true
-  type: ClusterIP
+  #type: ClusterIP
+  type: NodePort
   # This value will override the default which is determined by .Values.secureDocker
   #port: 2376
+  #nodePort:           # optional, pin nodePort for the docker daemon port
+
+  extraPorts:
+    - name: web-app
+      port: 8080
+      targetPort: 8080    # optional, defaults to port
+      protocol: TCP       # optional, defaults to TCP
+      nodePort: 30090     # optional, auto-assigned if omitted
 
 ingress:
   enabled: false
@@ -138,4 +147,69 @@ affinity: {}
 
 extraSecretNamesForEnvFrom: []
 # - my-secrets
+
+# Bridge network configuration for multi-interface NAT routing.
+# When enabled, creates a Multus bridge network and iptables DNAT rules
+# so pods are reachable from any host interface (ethernet, wifi, 5G).
+bridge:
+  enabled: true
+  name: "dind-br0"
+  cniVersion: "0.3.1"
+  isGateway: true
+  ipMasq: false        # handled by our DaemonSet for multi-interface support
+  hairpinMode: true
+  staticIP: "10.20.0.10"
+
+  # Policy-based routing configuration
+  routing:
+    enabled: true
+    rulePriority: 100       # ip rule priority for per-adapter fwmark rules (lower = higher precedence)
+
+    # Optional prefix-based ip rules (use higher priority numbers = lower precedence than fwmark rules)
+    prefixRoutes: []
+    # - prefix: "10.0.0.0/8"
+    #   tableId: 200
+    #   tableName: "dind_corp"
+    #   priority: 200
+
+    # Per-adapter routing configuration. Exactly ONE adapter must have preferred: true.
+    # The preferred adapter is used for pod-originated (non-DNAT) traffic via a from-subnet ip rule.
+    # Port-forwarding rules are owned by adapters for adapter-scoped PREROUTING DNAT and mangle marking.
+    networkAdapters:
+      - name: eth4
+        preferred: false        # exactly ONE adapter must have preferred: true
+        fwmark: "0x65"          # unique hex firewall mark for this adapter
+        tableId: 101            # routing table ID (1-252, must be unique)
+        tableName: "dind_eth4"  # routing table name
+        gateway: ""             # explicit gateway IP; auto-discovered if empty
+        useDefaultRoute: false  # if true, copies default route from main table
+        portForwarding:
+          rules:
+            - name: web-app
+              hostPort: 30080
+              destIP: "10.20.0.10"
+              destPort: 8080
+              protocol: tcp
+
+      - name: eth5
+        preferred: true         # pod-originated traffic (non-DNAT) uses this adapter's table
+        fwmark: "0x66"
+        tableId: 102
+        tableName: "dind_eth5"
+        gateway: ""
+        useDefaultRoute: false
+        portForwarding:
+          rules:
+            - name: web-app
+              hostPort: 30080
+              destIP: "10.20.0.10"
+              destPort: 8080
+              protocol: tcp
+
+  ipam:
+    type: "host-local"
+    subnet: "10.20.0.0/24"
+    rangeStart: "10.20.0.10"
+    rangeEnd: "10.20.0.50"
+    gateway: "10.20.0.1"
 

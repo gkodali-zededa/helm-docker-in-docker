@@ -1,0 +1,26 @@
+{{- if .Values.bridge.enabled }}
+apiVersion: "k8s.cni.cncf.io/v1"
+kind: NetworkAttachmentDefinition
+metadata:
+  name: {{ include "dind.fullname" . }}-bridge
+  labels:
+    {{- include "dind.labels" . | nindent 4 }}
+spec:
+  config: |
+    {
+      "cniVersion": {{ .Values.bridge.cniVersion | quote }},
+      "name": {{ .Values.bridge.name | quote }},
+      "type": "bridge",
+      "bridge": {{ .Values.bridge.name | quote }},
+      "isGateway": {{ .Values.bridge.isGateway }},
+      "ipMasq": {{ .Values.bridge.ipMasq }},
+      "hairpinMode": {{ .Values.bridge.hairpinMode }},
+      "ipam": {
+        "type": {{ .Values.bridge.ipam.type | quote }},
+        "subnet": {{ .Values.bridge.ipam.subnet | quote }},
+        "rangeStart": {{ .Values.bridge.ipam.rangeStart | quote }},
+        "rangeEnd": {{ .Values.bridge.ipam.rangeEnd | quote }},
+        "gateway": {{ .Values.bridge.ipam.gateway | quote }}
+      }
+    }
+{{- end }}
